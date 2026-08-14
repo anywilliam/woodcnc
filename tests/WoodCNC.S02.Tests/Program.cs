@@ -24,6 +24,7 @@ ImportOpenLwPolylineWithoutClosingEdge();
 DetectRotatingWorkpieceOrigin();
 ImportClassicPolylineVertexDxf();
 MergeMultipleClassicPolylinesDxf();
+ImportLwPolylineBulgeArcDxf();
 MergeShuffledLineArcDxf();
 ReportAmbiguousForkDxf();
 KeepDisconnectedIslandsSeparate();
@@ -502,6 +503,43 @@ EOF
     Assert(!profile.IsClosed, "Expected merged classic POLYLINE to remain open.");
     Assert(profile.Issues.Count == 0, "Expected no issues for ordered classic POLYLINE chain.");
     Assert(Math.Abs(profile.Width - 40) < 0.001, "Expected merged classic POLYLINE width.");
+}
+
+static void ImportLwPolylineBulgeArcDxf()
+{
+    var path = WriteTempDxf("""
+0
+SECTION
+2
+ENTITIES
+0
+LWPOLYLINE
+90
+2
+70
+0
+10
+0
+20
+0
+42
+1
+10
+10
+20
+0
+0
+ENDSEC
+0
+EOF
+""");
+
+    var result = new DxfContourImporter().Import(path);
+    Assert(result.Success, "Expected LWPOLYLINE bulge arc import success.");
+    var profile = RequireProfile(result, "Expected LWPOLYLINE bulge arc profile.");
+    Assert(profile.Points.Count > 8, "Expected bulge arc to be sampled, not treated as a straight line.");
+    Assert(profile.Height > 4.9, "Expected bulge arc height.");
+    Assert(!profile.IsClosed, "Expected open bulge arc to remain open.");
 }
 
 static void MergeShuffledLineArcDxf()

@@ -337,12 +337,17 @@ public sealed class DxfContourImporter
 
     private static IEnumerable<ContourSegment> CreatePolylineSegments(DxfEntity entity, int entityIndex)
     {
-        if (entity.Points.Count < 2)
+        if (entity.Vertices.Count < 2)
         {
             yield break;
         }
 
-        var points = entity.Points.ToList();
+        var points = SamplePolyline(entity.Vertices, (entity.Flags & 1) == 1);
+        if (points.Count < 2)
+        {
+            yield break;
+        }
+
         var isClosedByFlag = (entity.Flags & 1) == 1;
         if (isClosedByFlag && !Near(points[0], points[^1], MinimumEndpointTolerance))
         {
@@ -378,6 +383,74 @@ public sealed class DxfContourImporter
             points.Add(new ContourPoint(centerX + Math.Cos(angle) * radius, centerY + Math.Sin(angle) * radius));
         }
 
+        return points;
+    }
+
+    private static List<ContourPoint> SamplePolyline(IReadOnlyList<DxfVertex> vertices, bool isClosed)
+    {
+        var points = new List<ContourPoint>();
+        for (var i = 0; i + 1 < vertices.Count; i++)
+        {
+            AppendPolylineEdge(points, vertices[i], vertices[i + 1].Point);
+        }
+
+        if (isClosed)
+        {
+            AppendPolylineEdge(points, vertices[^1], vertices[0].Point);
+        }
+
+        return points;
+    }
+
+    private static void AppendPolylineEdge(List<ContourPoint> target, DxfVertex startVertex, ContourPoint end)
+    {
+        var edgePoints = Math.Abs(startVertex.Bulge) < 0.0000001
+            ? new[] { startVertex.Point, end }
+            : SampleBulgeArc(startVertex.Point, end, startVertex.Bulge);
+        AppendPoints(target, edgePoints);
+    }
+
+    private static IReadOnlyList<ContourPoint> SampleBulgeArc(ContourPoint start, ContourPoint end, double bulge)
+    {
+        var chordX = end.X - start.X;
+        var chordY = end.Y - start.Y;
+        var chord = Math.Sqrt(chordX * chordX + chordY * chordY);
+        if (chord < 0.0000001)
+        {
+            return new[] { start, end };
+        }
+
+        var theta = 4 * Math.Atan(bulge);
+        var radius = Math.Abs(chord / (2 * Math.Sin(theta / 2)));
+        var midX = (start.X + end.X) / 2;
+        var midY = (start.Y + end.Y) / 2;
+        var unitX = chordX / chord;
+        var unitY = chordY / chord;
+        var centerDistance = chord / (2 * Math.Tan(theta / 2));
+        var centerX = midX - unitY * centerDistance;
+        var centerY = midY + unitX * centerDistance;
+        var startAngle = Math.Atan2(start.Y - centerY, start.X - centerX);
+        var endAngle = Math.Atan2(end.Y - centerY, end.X - centerX);
+        var sweep = endAngle - startAngle;
+        if (theta > 0 && sweep < 0)
+        {
+            sweep += Math.PI * 2;
+        }
+        else if (theta < 0 && sweep > 0)
+        {
+            sweep -= Math.PI * 2;
+        }
+
+        var segments = Math.Max(4, (int)Math.Ceiling(Math.Abs(sweep) / (Math.PI / 48)));
+        var points = new List<ContourPoint>();
+        for (var i = 0; i <= segments; i++)
+        {
+            var angle = startAngle + sweep * i / segments;
+            points.Add(new ContourPoint(centerX + Math.Cos(angle) * radius, centerY + Math.Sin(angle) * radius));
+        }
+
+        points[0] = start;
+        points[^1] = end;
         return points;
     }
 
@@ -457,7 +530,7 @@ public sealed class DxfContourImporter
                 {
                     if (inEntitiesSection && !string.IsNullOrWhiteSpace(currentType))
                     {
-                        if (collectingClassicPolyline && current.Points.Count > 0)
+                        if (collectingClassicPolyline && current.Vertices.Count > 0)
                         {
                             entities.Add(current with { Type = "POLYLINE" });
                             collectingClassicPolyline = false;
@@ -486,7 +559,7 @@ public sealed class DxfContourImporter
                 {
                     if (currentType == "VERTEX")
                     {
-                        current.Points.AddRange(pendingVertex.Points);
+                        current.Vertices.AddRange(pendingVertex.Vertices);
                         pendingVertex = new DxfEntity { Type = "VERTEX" };
                     }
 
@@ -562,10 +635,10 @@ public sealed class DxfContourImporter
         {
             if (currentType == "VERTEX")
             {
-                current.Points.AddRange(pendingVertex.Points);
+                current.Vertices.AddRange(pendingVertex.Vertices);
             }
 
-            if (current.Points.Count > 0)
+            if (current.Vertices.Count > 0)
             {
                 entities.Add(current with { Type = "POLYLINE" });
             }
@@ -654,7 +727,7 @@ public sealed class DxfContourImporter
         public double StartAngle { get; init; }
         public double EndAngle { get; init; }
         public int Flags { get; init; }
-        public List<ContourPoint> Points { get; init; } = new();
+        public List<DxfVertex> Vertices { get; init; } = new();
 
         public DxfEntity AddLine(string code, string value) => code switch
         {
@@ -687,12 +760,17 @@ public sealed class DxfContourImporter
         {
             if (code == "10")
             {
-                Points.Add(new ContourPoint(Parse(value), 0));
+                Vertices.Add(new DxfVertex(new ContourPoint(Parse(value), 0), 0));
             }
-            else if (code == "20" && Points.Count > 0)
+            else if (code == "20" && Vertices.Count > 0)
             {
-                var point = Points[^1];
-                Points[^1] = point with { Y = Parse(value) };
+                var vertex = Vertices[^1];
+                Vertices[^1] = vertex with { Point = vertex.Point with { Y = Parse(value) } };
+            }
+            else if (code == "42" && Vertices.Count > 0)
+            {
+                var vertex = Vertices[^1];
+                Vertices[^1] = vertex with { Bulge = Parse(value) };
             }
             else if (code == "70")
             {
@@ -729,4 +807,6 @@ public sealed class DxfContourImporter
         private static double Parse(string value) => double.Parse(value, CultureInfo.InvariantCulture);
         private static int ParseInt(string value) => int.Parse(value, CultureInfo.InvariantCulture);
     }
+
+    private sealed record DxfVertex(ContourPoint Point, double Bulge);
 }
