@@ -23,6 +23,10 @@ DetectOpenLineDxf();
 ImportOpenLwPolylineWithoutClosingEdge();
 DetectRotatingWorkpieceOrigin();
 ImportClassicPolylineVertexDxf();
+MergeMultipleClassicPolylinesDxf();
+MergeShuffledLineArcDxf();
+ReportAmbiguousForkDxf();
+KeepDisconnectedIslandsSeparate();
 ConfirmContourSize();
 InspectImageAssistFile();
 
@@ -409,6 +413,245 @@ EOF
     Assert(profile.IsClosed, "Expected classic POLYLINE flag 1 to close profile.");
     Assert(Math.Abs(profile.Width - 10) < 0.001, "Expected classic POLYLINE width.");
     Assert(Math.Abs(profile.Height - 10) < 0.001, "Expected classic POLYLINE height.");
+}
+
+static void MergeMultipleClassicPolylinesDxf()
+{
+    var path = WriteTempDxf("""
+0
+SECTION
+2
+ENTITIES
+0
+POLYLINE
+66
+1
+70
+0
+0
+VERTEX
+10
+0
+20
+0
+0
+VERTEX
+10
+10
+20
+0
+0
+SEQEND
+0
+POLYLINE
+66
+1
+70
+0
+0
+VERTEX
+10
+10
+20
+0
+0
+VERTEX
+10
+20
+20
+5
+0
+VERTEX
+10
+30
+20
+5
+0
+SEQEND
+0
+POLYLINE
+66
+1
+70
+0
+0
+VERTEX
+10
+30
+20
+5
+0
+VERTEX
+10
+40
+20
+0
+0
+SEQEND
+0
+ENDSEC
+0
+EOF
+""");
+
+    var result = new DxfContourImporter().Import(path);
+    Assert(result.Success, "Expected multiple classic POLYLINE DXF import success.");
+    Assert(result.Profiles.Count == 1, "Expected multiple classic POLYLINE entities to merge by endpoints.");
+    var profile = RequireProfile(result, "Expected merged classic POLYLINE profile.");
+    Assert(profile.Points.Count >= 4, "Expected merged classic POLYLINE point chain.");
+    Assert(!profile.IsClosed, "Expected merged classic POLYLINE to remain open.");
+    Assert(profile.Issues.Count == 0, "Expected no issues for ordered classic POLYLINE chain.");
+    Assert(Math.Abs(profile.Width - 40) < 0.001, "Expected merged classic POLYLINE width.");
+}
+
+static void MergeShuffledLineArcDxf()
+{
+    var path = WriteTempDxf("""
+0
+SECTION
+0
+ENTITIES
+0
+LINE
+10
+-10
+20
+10
+11
+-10
+21
+0
+0
+ARC
+10
+0
+20
+0
+40
+10
+50
+0
+51
+90
+0
+LINE
+10
+0
+20
+10
+11
+-10
+21
+10
+0
+LINE
+10
+-10
+20
+0
+11
+10
+21
+0
+0
+ENDSEC
+0
+EOF
+""");
+
+    var result = new DxfContourImporter().Import(path);
+    Assert(result.Success, "Expected shuffled LINE + ARC DXF import success.");
+    Assert(result.Profiles.Count == 1, "Expected topology engine to merge shuffled LINE + ARC into one chain.");
+    var profile = RequireProfile(result, "Expected shuffled LINE + ARC profile.");
+    Assert(profile.IsClosed, "Expected shuffled LINE + ARC profile to be closed.");
+    Assert(profile.Issues.Count == 0, "Expected no issues for unambiguous shuffled LINE + ARC profile.");
+}
+
+static void ReportAmbiguousForkDxf()
+{
+    var path = WriteTempDxf("""
+0
+SECTION
+0
+ENTITIES
+0
+LINE
+10
+0
+20
+0
+11
+10
+21
+0
+0
+LINE
+10
+10
+20
+0
+11
+20
+21
+0
+0
+LINE
+10
+10
+20
+0
+11
+10
+21
+10
+0
+ENDSEC
+0
+EOF
+""");
+
+    var result = new DxfContourImporter().Import(path);
+    Assert(result.Success, "Expected forked DXF to import for preview.");
+    Assert(result.Diagnostics.Any(x => x.Contains("分叉") || x.Contains("歧义")), "Expected fork diagnostic.");
+    Assert(result.Profiles.Any(x => x.Issues.Count > 0), "Expected forked profile issue.");
+}
+
+static void KeepDisconnectedIslandsSeparate()
+{
+    var path = WriteTempDxf("""
+0
+SECTION
+0
+ENTITIES
+0
+LINE
+10
+0
+20
+0
+11
+10
+21
+0
+0
+LINE
+10
+100
+20
+0
+11
+110
+21
+0
+0
+ENDSEC
+0
+EOF
+""");
+
+    var result = new DxfContourImporter().Import(path);
+    Assert(result.Success, "Expected disconnected DXF to import for preview.");
+    Assert(result.Profiles.Count == 2, "Expected disconnected islands to remain separate profiles.");
 }
 
 static string WriteTempDxf(string text)

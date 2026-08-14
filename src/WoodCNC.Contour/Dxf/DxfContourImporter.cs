@@ -6,19 +6,16 @@ namespace WoodCNC.Contour.Dxf;
 
 public sealed class DxfContourImporter
 {
+    private const double MinimumEndpointTolerance = 0.001;
+    private const double MaximumEndpointTolerance = 0.05;
+
     public ContourImportResult Import(string path)
     {
         var diagnostics = new List<string>();
-        var profiles = new List<ContourProfile>();
 
         if (!File.Exists(path))
         {
-            return new ContourImportResult
-            {
-                Success = false,
-                Profiles = Array.Empty<ContourProfile>(),
-                Diagnostics = new[] { "DXF 文件不存在。" }
-            };
+            return Failed("DXF 文件不存在。");
         }
 
         string[] lines;
@@ -28,53 +25,38 @@ public sealed class DxfContourImporter
         }
         catch (IOException ex)
         {
-            return new ContourImportResult
-            {
-                Success = false,
-                Profiles = Array.Empty<ContourProfile>(),
-                Diagnostics = new[] { $"DXF 文件读取失败: {ex.Message}" }
-            };
+            return Failed($"DXF 文件读取失败: {ex.Message}");
         }
         catch (UnauthorizedAccessException ex)
         {
-            return new ContourImportResult
-            {
-                Success = false,
-                Profiles = Array.Empty<ContourProfile>(),
-                Diagnostics = new[] { $"DXF 文件没有读取权限: {ex.Message}" }
-            };
+            return Failed($"DXF 文件没有读取权限: {ex.Message}");
         }
 
+        IReadOnlyList<DxfEntity> entities;
         try
         {
-            var entities = ParseEntities(lines, diagnostics);
-            profiles.AddRange(CreateLineProfiles(path, entities.Where(x => x.Type == "LINE").ToList()));
-
-            foreach (var entity in entities.Where(x => x.Type != "LINE"))
-            {
-                var profile = entity.ToProfile(path);
-                if (profile is not null)
-                {
-                    profiles.Add(profile);
-                }
-            }
-
-            profiles = MergeConnectedProfiles(profiles).ToList();
+            entities = ParseEntities(lines, diagnostics);
         }
         catch (FormatException ex)
         {
             diagnostics.Add($"DXF 数值格式无法解析: {ex.Message}");
+            entities = Array.Empty<DxfEntity>();
         }
         catch (OverflowException ex)
         {
             diagnostics.Add($"DXF 数值超出范围: {ex.Message}");
+            entities = Array.Empty<DxfEntity>();
         }
+
+        var geometry = BuildGeometry(path, entities, diagnostics);
+        var profiles = BuildProfilesFromGeometry(path, geometry, diagnostics).ToList();
 
         int? recommendedIndex = ChooseRecommendedProfile(profiles);
         var groupBounds = profiles.Count > 0 ? ContourBounds.FromPoints(profiles.SelectMany(x => x.Points)) : (ContourBounds?)null;
         var origin = groupBounds is ContourBounds bounds
             ? new ContourOrigin(bounds.MaxX, (bounds.MinY + bounds.MaxY) / 2, "右端中心原点：按导入的 XY 俯视轮廓组最右侧和上下中心推断。")
             : (ContourOrigin?)null;
+
         if (profiles.Count == 0)
         {
             diagnostics.Add("未识别到可用轮廓。");
@@ -94,33 +76,13 @@ public sealed class DxfContourImporter
             Origin = origin,
             Diagnostics = diagnostics
         };
-    }
 
-    private static IReadOnlyList<ContourProfile> CreateLineProfiles(string path, IReadOnlyList<DxfEntity> lines)
-    {
-        if (lines.Count == 0)
+        static ContourImportResult Failed(string diagnostic) => new()
         {
-            return Array.Empty<ContourProfile>();
-        }
-
-        return lines.Select(line =>
-        {
-            var points = new[]
-            {
-                new ContourPoint(line.X1, line.Y1),
-                new ContourPoint(line.X2, line.Y2)
-            };
-
-            return new ContourProfile
-            {
-                SourceType = ContourSourceType.Dxf,
-                SourceFile = path,
-                Points = points,
-                Bounds = ContourBounds.FromPoints(points),
-                IsClosed = false,
-                Issues = Array.Empty<string>()
-            };
-        }).ToArray();
+            Success = false,
+            Profiles = Array.Empty<ContourProfile>(),
+            Diagnostics = new[] { diagnostic }
+        };
     }
 
     private static string[] ReadAllLinesShared(string path)
@@ -136,98 +98,295 @@ public sealed class DxfContourImporter
         return lines.ToArray();
     }
 
-    private static IReadOnlyList<ContourProfile> MergeConnectedProfiles(IReadOnlyList<ContourProfile> profiles)
+    private static GeometryBuildResult BuildGeometry(string path, IReadOnlyList<DxfEntity> entities, List<string> diagnostics)
     {
-        var remaining = profiles
-            .Where(profile => profile.Points.Count > 0)
-            .Select(profile => profile with { Points = profile.Points.ToList() })
-            .ToList();
-        var merged = new List<ContourProfile>();
+        var segments = new List<ContourSegment>();
+        var closedProfiles = new List<ContourProfile>();
+        var unsupported = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
-        while (remaining.Count > 0)
+        foreach (var entity in entities.Select((entity, index) => new { entity, index }))
         {
-            var current = remaining[0];
-            remaining.RemoveAt(0);
-            var changed = true;
-
-            while (changed)
+            switch (entity.entity.Type)
             {
-                changed = false;
-                for (var index = 0; index < remaining.Count; index++)
-                {
-                    if (!TryMerge(current, remaining[index], out var next))
-                    {
-                        continue;
-                    }
+                case "LINE":
+                    segments.Add(CreateLineSegment(entity.entity, entity.index));
+                    break;
+                case "ARC":
+                    segments.Add(CreateArcSegment(entity.entity, entity.index));
+                    break;
+                case "CIRCLE":
+                    closedProfiles.Add(entity.entity.CreateCircleProfile(path, entity.index));
+                    break;
+                case "LWPOLYLINE":
+                case "POLYLINE":
+                    segments.AddRange(CreatePolylineSegments(entity.entity, entity.index));
+                    break;
+                default:
+                    unsupported.TryGetValue(entity.entity.Type, out var count);
+                    unsupported[entity.entity.Type] = count + 1;
+                    break;
+            }
+        }
 
-                    current = next;
-                    remaining.RemoveAt(index);
-                    changed = true;
+        foreach (var item in unsupported.OrderBy(x => x.Key))
+        {
+            diagnostics.Add($"DXF 暂不支持实体 {item.Key}，数量 {item.Value}。");
+        }
+
+        diagnostics.Add($"DXF 实体 {entities.Count} 个，几何段 {segments.Count} 条，独立闭合轮廓 {closedProfiles.Count} 条。");
+        return new GeometryBuildResult(segments, closedProfiles);
+    }
+
+    private static IEnumerable<ContourProfile> BuildProfilesFromGeometry(string path, GeometryBuildResult geometry, List<string> diagnostics)
+    {
+        foreach (var profile in geometry.ClosedProfiles)
+        {
+            yield return profile;
+        }
+
+        foreach (var chain in BuildChains(geometry.Segments, diagnostics))
+        {
+            if (chain.Points.Count < 2)
+            {
+                continue;
+            }
+
+            yield return new ContourProfile
+            {
+                SourceType = ContourSourceType.Dxf,
+                SourceFile = path,
+                Points = chain.Points,
+                Bounds = ContourBounds.FromPoints(chain.Points),
+                IsClosed = chain.IsClosed,
+                Issues = chain.Issues
+            };
+        }
+    }
+
+    private static IReadOnlyList<ContourChain> BuildChains(IReadOnlyList<ContourSegment> segments, List<string> diagnostics)
+    {
+        if (segments.Count == 0)
+        {
+            return Array.Empty<ContourChain>();
+        }
+
+        var tolerance = CalculateEndpointTolerance(segments);
+        var clusters = EndpointClusters.Build(segments, tolerance);
+        var segmentStates = segments
+            .Select((segment, index) => new SegmentState(index, segment, clusters.IdOf(segment.Start), clusters.IdOf(segment.End)))
+            .ToArray();
+        var byCluster = segmentStates
+            .SelectMany(segment => new[]
+            {
+                new ClusterSegment(segment.StartCluster, segment.Index),
+                new ClusterSegment(segment.EndCluster, segment.Index)
+            })
+            .GroupBy(x => x.ClusterId)
+            .ToDictionary(x => x.Key, x => x.Select(item => item.SegmentIndex).Distinct().ToList());
+        var unused = new HashSet<int>(segmentStates.Select(x => x.Index));
+        var chains = new List<ContourChain>();
+        var ambiguousClusters = byCluster.Where(x => x.Value.Count > 2).Select(x => x.Key).ToArray();
+
+        if (ambiguousClusters.Length > 0)
+        {
+            diagnostics.Add($"DXF 存在 {ambiguousClusters.Length} 个分叉/歧义连接点，相关轮廓会标记问题并阻断生成。");
+        }
+
+        while (unused.Count > 0)
+        {
+            var seed = ChooseSeed(unused, segmentStates, byCluster);
+            unused.Remove(seed.Index);
+
+            var oriented = OrientSeed(seed, byCluster);
+            var points = oriented.Segment.Points.ToList();
+            var usedClusters = new HashSet<int> { oriented.StartCluster, oriented.EndCluster };
+            var issues = new List<string>();
+            var currentCluster = oriented.EndCluster;
+            var startCluster = oriented.StartCluster;
+
+            while (true)
+            {
+                var nextCandidates = byCluster.TryGetValue(currentCluster, out var attached)
+                    ? attached.Where(unused.Contains).ToList()
+                    : new List<int>();
+
+                if (nextCandidates.Count == 0)
+                {
+                    break;
+                }
+
+                if (nextCandidates.Count > 1)
+                {
+                    issues.Add("轮廓连接存在歧义，需要人工确认。");
+                    break;
+                }
+
+                var next = segmentStates[nextCandidates[0]];
+                unused.Remove(next.Index);
+                var nextOriented = OrientFromCluster(next, currentCluster);
+                AppendPoints(points, nextOriented.Segment.Points);
+                currentCluster = nextOriented.EndCluster;
+                usedClusters.Add(currentCluster);
+
+                if (currentCluster == startCluster)
+                {
                     break;
                 }
             }
 
-            merged.Add(NormalizeProfile(current));
+            var isClosed = points.Count > 2 && Near(points[0], points[^1], tolerance);
+            if (isClosed)
+            {
+                points[^1] = points[0];
+            }
+            else
+            {
+                var startDegree = byCluster.TryGetValue(startCluster, out var startAttached) ? startAttached.Count : 0;
+                var endDegree = byCluster.TryGetValue(currentCluster, out var endAttached) ? endAttached.Count : 0;
+                if (startDegree != 1 || endDegree != 1)
+                {
+                    issues.Add("轮廓未闭合且端点连接不完整，需要确认断点。");
+                }
+            }
+
+            if (usedClusters.Any(ambiguousClusters.Contains) && !issues.Contains("轮廓连接存在歧义，需要人工确认。"))
+            {
+                issues.Add("轮廓经过分叉连接点，需要人工确认。");
+            }
+
+            chains.Add(new ContourChain(points, isClosed, issues.Distinct().ToArray()));
         }
 
-        return merged;
+        diagnostics.Add($"DXF 拓扑合并得到 {chains.Count} 条轮廓链，端点容差 {tolerance:F4}。");
+        return chains;
     }
 
-    private static bool TryMerge(ContourProfile a, ContourProfile b, out ContourProfile merged)
+    private static SegmentState ChooseSeed(HashSet<int> unused, IReadOnlyList<SegmentState> segments, IReadOnlyDictionary<int, List<int>> byCluster)
     {
-        var aPoints = a.Points.ToList();
-        var bPoints = b.Points.ToList();
-        var aStart = aPoints[0];
-        var aEnd = aPoints[^1];
-        var bStart = bPoints[0];
-        var bEnd = bPoints[^1];
-
-        if (Near(aEnd, bStart))
-        {
-            merged = a with { Points = aPoints.Concat(bPoints.Skip(1)).ToList() };
-            return true;
-        }
-
-        if (Near(aEnd, bEnd))
-        {
-            bPoints.Reverse();
-            merged = a with { Points = aPoints.Concat(bPoints.Skip(1)).ToList() };
-            return true;
-        }
-
-        if (Near(aStart, bEnd))
-        {
-            merged = a with { Points = bPoints.Concat(aPoints.Skip(1)).ToList() };
-            return true;
-        }
-
-        if (Near(aStart, bStart))
-        {
-            bPoints.Reverse();
-            merged = a with { Points = bPoints.Concat(aPoints.Skip(1)).ToList() };
-            return true;
-        }
-
-        merged = a;
-        return false;
+        return unused
+            .Select(index => segments[index])
+            .OrderByDescending(segment => IsEndpoint(segment.StartCluster, byCluster) || IsEndpoint(segment.EndCluster, byCluster))
+            .ThenBy(segment => segment.Index)
+            .First();
     }
 
-    private static ContourProfile NormalizeProfile(ContourProfile profile)
+    private static OrientedSegment OrientSeed(SegmentState segment, IReadOnlyDictionary<int, List<int>> byCluster)
     {
-        var points = profile.Points.ToList();
-        var isClosed = points.Count > 2 && Near(points[0], points[^1]);
-        if (isClosed)
+        if (IsEndpoint(segment.EndCluster, byCluster) && !IsEndpoint(segment.StartCluster, byCluster))
         {
-            points[^1] = points[0];
+            return new OrientedSegment(segment.Segment.Reversed(), segment.EndCluster, segment.StartCluster);
         }
 
-        return profile with
+        return new OrientedSegment(segment.Segment, segment.StartCluster, segment.EndCluster);
+    }
+
+    private static OrientedSegment OrientFromCluster(SegmentState segment, int cluster)
+    {
+        if (segment.StartCluster == cluster)
         {
-            Points = points,
-            Bounds = ContourBounds.FromPoints(points),
-            IsClosed = isClosed,
-            Issues = Array.Empty<string>()
+            return new OrientedSegment(segment.Segment, segment.StartCluster, segment.EndCluster);
+        }
+
+        return new OrientedSegment(segment.Segment.Reversed(), segment.EndCluster, segment.StartCluster);
+    }
+
+    private static bool IsEndpoint(int clusterId, IReadOnlyDictionary<int, List<int>> byCluster)
+    {
+        return byCluster.TryGetValue(clusterId, out var attached) && attached.Count == 1;
+    }
+
+    private static void AppendPoints(List<ContourPoint> target, IReadOnlyList<ContourPoint> next)
+    {
+        if (next.Count == 0)
+        {
+            return;
+        }
+
+        var skip = target.Count > 0 && Near(target[^1], next[0], MaximumEndpointTolerance) ? 1 : 0;
+        target.AddRange(next.Skip(skip));
+    }
+
+    private static ContourSegment CreateLineSegment(DxfEntity entity, int entityIndex)
+    {
+        var start = new ContourPoint(entity.X1, entity.Y1);
+        var end = new ContourPoint(entity.X2, entity.Y2);
+        return new ContourSegment
+        {
+            Kind = ContourSegmentKind.Line,
+            Start = start,
+            End = end,
+            Points = new[] { start, end },
+            SourceEntityType = entity.Type,
+            SourceEntityIndex = entityIndex
         };
+    }
+
+    private static ContourSegment CreateArcSegment(DxfEntity entity, int entityIndex)
+    {
+        var points = SampleArc(entity.X1, entity.Y1, entity.Radius, entity.StartAngle, entity.EndAngle, 48);
+        return new ContourSegment
+        {
+            Kind = ContourSegmentKind.Arc,
+            Start = points[0],
+            End = points[^1],
+            Points = points,
+            SourceEntityType = entity.Type,
+            SourceEntityIndex = entityIndex
+        };
+    }
+
+    private static IEnumerable<ContourSegment> CreatePolylineSegments(DxfEntity entity, int entityIndex)
+    {
+        if (entity.Points.Count < 2)
+        {
+            yield break;
+        }
+
+        var points = entity.Points.ToList();
+        var isClosedByFlag = (entity.Flags & 1) == 1;
+        if (isClosedByFlag && !Near(points[0], points[^1], MinimumEndpointTolerance))
+        {
+            points.Add(points[0]);
+        }
+
+        yield return new ContourSegment
+        {
+            Kind = ContourSegmentKind.PolylinePart,
+            Start = points[0],
+            End = points[^1],
+            Points = points,
+            SourceEntityType = entity.Type,
+            SourceEntityIndex = entityIndex
+        };
+    }
+
+    private static IReadOnlyList<ContourPoint> SampleArc(double centerX, double centerY, double radius, double startAngle, double endAngle, int minimumSegments)
+    {
+        var points = new List<ContourPoint>();
+        var start = startAngle * Math.PI / 180;
+        var end = endAngle * Math.PI / 180;
+        if (end < start)
+        {
+            end += Math.PI * 2;
+        }
+
+        var sweep = end - start;
+        var segments = Math.Max(minimumSegments, (int)Math.Ceiling(sweep / (Math.PI / 48)));
+        for (var i = 0; i <= segments; i++)
+        {
+            var angle = start + sweep * i / segments;
+            points.Add(new ContourPoint(centerX + Math.Cos(angle) * radius, centerY + Math.Sin(angle) * radius));
+        }
+
+        return points;
+    }
+
+    private static double CalculateEndpointTolerance(IReadOnlyList<ContourSegment> segments)
+    {
+        var points = segments.SelectMany(segment => new[] { segment.Start, segment.End }).ToArray();
+        var bounds = ContourBounds.FromPoints(points);
+        var diagonal = Math.Sqrt(bounds.Width * bounds.Width + bounds.Height * bounds.Height);
+        return Math.Clamp(diagonal * 0.00001, MinimumEndpointTolerance, MaximumEndpointTolerance);
     }
 
     private static int? ChooseRecommendedProfile(IReadOnlyList<ContourProfile> profiles)
@@ -239,8 +398,8 @@ public sealed class DxfContourImporter
 
         return profiles
             .Select((profile, index) => new { profile, index })
-            .OrderByDescending(x => x.profile.IsClosed)
-            .ThenBy(x => x.profile.Issues.Count)
+            .OrderBy(x => x.profile.Issues.Count)
+            .ThenByDescending(x => x.profile.IsClosed)
             .ThenByDescending(x => x.profile.Bounds.Width * x.profile.Bounds.Height)
             .ThenByDescending(x => x.profile.Points.Count)
             .First()
@@ -252,9 +411,9 @@ public sealed class DxfContourImporter
         return Math.Abs(a.X - b.X) < 0.001 && Math.Abs(a.Y - b.Y) < 0.001;
     }
 
-    private static bool Near(ContourPoint a, ContourPoint b)
+    private static bool Near(ContourPoint a, ContourPoint b, double tolerance)
     {
-        return Math.Abs(a.X - b.X) <= 0.05 && Math.Abs(a.Y - b.Y) <= 0.05;
+        return Math.Abs(a.X - b.X) <= tolerance && Math.Abs(a.Y - b.Y) <= tolerance;
     }
 
     private static List<DxfEntity> ParseEntities(string[] lines, List<string> diagnostics)
@@ -305,7 +464,7 @@ public sealed class DxfContourImporter
                         }
                         else
                         {
-                        entities.Add(current with { Type = currentType });
+                            entities.Add(current with { Type = currentType });
                         }
                     }
 
@@ -354,7 +513,7 @@ public sealed class DxfContourImporter
                 }
 
                 currentType = nextType;
-                current = new DxfEntity();
+                current = new DxfEntity { Type = nextType };
                 if (currentType == "POLYLINE")
                 {
                     collectingClassicPolyline = true;
@@ -424,6 +583,66 @@ public sealed class DxfContourImporter
         return entities;
     }
 
+    private sealed record GeometryBuildResult(IReadOnlyList<ContourSegment> Segments, IReadOnlyList<ContourProfile> ClosedProfiles);
+    private sealed record SegmentState(int Index, ContourSegment Segment, int StartCluster, int EndCluster);
+    private sealed record ClusterSegment(int ClusterId, int SegmentIndex);
+    private sealed record OrientedSegment(ContourSegment Segment, int StartCluster, int EndCluster);
+    private sealed record ContourChain(IReadOnlyList<ContourPoint> Points, bool IsClosed, IReadOnlyList<string> Issues);
+
+    private sealed class EndpointClusters
+    {
+        private readonly List<EndpointCluster> _clusters;
+        private readonly Dictionary<ContourPoint, int> _ids;
+
+        private EndpointClusters(List<EndpointCluster> clusters, Dictionary<ContourPoint, int> ids)
+        {
+            _clusters = clusters;
+            _ids = ids;
+        }
+
+        public static EndpointClusters Build(IReadOnlyList<ContourSegment> segments, double tolerance)
+        {
+            var clusters = new List<EndpointCluster>();
+            var ids = new Dictionary<ContourPoint, int>();
+
+            foreach (var point in segments.SelectMany(segment => new[] { segment.Start, segment.End }))
+            {
+                var id = FindOrAdd(clusters, point, tolerance);
+                ids[point] = id;
+            }
+
+            return new EndpointClusters(clusters, ids);
+        }
+
+        public int IdOf(ContourPoint point) => _ids[point];
+
+        private static int FindOrAdd(List<EndpointCluster> clusters, ContourPoint point, double tolerance)
+        {
+            for (var i = 0; i < clusters.Count; i++)
+            {
+                if (Near(clusters[i].Center, point, tolerance))
+                {
+                    clusters[i] = clusters[i].Add(point);
+                    return i;
+                }
+            }
+
+            clusters.Add(new EndpointCluster(point, 1));
+            return clusters.Count - 1;
+        }
+    }
+
+    private sealed record EndpointCluster(ContourPoint Center, int Count)
+    {
+        public EndpointCluster Add(ContourPoint point)
+        {
+            var nextCount = Count + 1;
+            return new EndpointCluster(
+                new ContourPoint((Center.X * Count + point.X) / nextCount, (Center.Y * Count + point.Y) / nextCount),
+                nextCount);
+        }
+    }
+
     private sealed record DxfEntity
     {
         public string Type { get; init; } = string.Empty;
@@ -488,74 +707,13 @@ public sealed class DxfContourImporter
             return code == "70" ? this with { Flags = ParseInt(value) } : this;
         }
 
-        public ContourProfile? ToProfile(string sourceFile)
+        public ContourProfile CreateCircleProfile(string sourceFile, int entityIndex)
         {
-            return Type switch
-            {
-                "CIRCLE" => CreateCircleProfile(sourceFile),
-                "ARC" => CreateArcProfile(sourceFile),
-                "LWPOLYLINE" or "POLYLINE" => CreatePolylineProfile(sourceFile),
-                _ => null
-            };
-        }
-
-        private ContourProfile? CreateCircleProfile(string sourceFile)
-        {
-            var points = new List<ContourPoint>();
-            const int segments = 96;
-            for (var i = 0; i <= segments; i++)
-            {
-                var angle = Math.PI * 2 * i / segments;
-                points.Add(new ContourPoint(X1 + Math.Cos(angle) * Radius, Y1 + Math.Sin(angle) * Radius));
-            }
-
-            points.Add(points[0]);
-            return new ContourProfile
-            {
-                SourceType = ContourSourceType.Dxf,
-                SourceFile = sourceFile,
-                Points = points,
-                Bounds = ContourBounds.FromPoints(points),
-                IsClosed = true
-            };
-        }
-
-        private ContourProfile? CreateArcProfile(string sourceFile)
-        {
-            var points = new List<ContourPoint>();
-            const int segments = 48;
-            var start = StartAngle * Math.PI / 180;
-            var end = EndAngle * Math.PI / 180;
-            if (end < start)
-            {
-                end += Math.PI * 2;
-            }
-
-            for (var i = 0; i <= segments; i++)
-            {
-                var angle = start + (end - start) * i / segments;
-                points.Add(new ContourPoint(X1 + Math.Cos(angle) * Radius, Y1 + Math.Sin(angle) * Radius));
-            }
-
-            return new ContourProfile
-            {
-                SourceType = ContourSourceType.Dxf,
-                SourceFile = sourceFile,
-                Points = points,
-                Bounds = ContourBounds.FromPoints(points),
-                IsClosed = false
-            };
-        }
-
-        private ContourProfile? CreatePolylineProfile(string sourceFile)
-        {
-            var points = Points.ToList();
-            var isClosedByFlag = (Flags & 1) == 1;
-            if (isClosedByFlag && points.Count > 0 && !SamePoint(points[0], points[^1]))
+            var points = SampleArc(X1, Y1, Radius, 0, 360, 96).ToList();
+            if (!SamePoint(points[0], points[^1]))
             {
                 points.Add(points[0]);
             }
-            var isClosed = points.Count > 2 && SamePoint(points[0], points[^1]);
 
             return new ContourProfile
             {
@@ -563,7 +721,7 @@ public sealed class DxfContourImporter
                 SourceFile = sourceFile,
                 Points = points,
                 Bounds = ContourBounds.FromPoints(points),
-                IsClosed = isClosed,
+                IsClosed = true,
                 Issues = Array.Empty<string>()
             };
         }
