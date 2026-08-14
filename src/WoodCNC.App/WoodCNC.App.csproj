@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\WoodCNC.Core\WoodCNC.Core.csproj" />
+    <ProjectReference Include="..\WoodCNC.Contour\WoodCNC.Contour.csproj" />
+    <ProjectReference Include="..\WoodCNC.IO\WoodCNC.IO.csproj" />
+    <ProjectReference Include="..\WoodCNC.Parsing\WoodCNC.Parsing.csproj" />
+    <ProjectReference Include="..\WoodCNC.Simulation\WoodCNC.Simulation.csproj" />
+  </ItemGroup>
+</Project>
+

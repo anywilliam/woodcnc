@@ -1,0 +1,26 @@
+bin/
+obj/
+**/bin/
+**/obj/
+.vs/
+.idea/
+.vscode/
+
+*.user
+*.suo
+*.nupkg
+
+publish/
+artifacts/
+logs/
+
+# Keep the new repository clean. Old executable packages and reverse-analysis
+# materials stay in the parent reference workspace unless explicitly copied.
+legacy/
+*.zip
+*.rar
+*.7z
+*.exe
+*.dll
+*.pdb
+*.mp4
